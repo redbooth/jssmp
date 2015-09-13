@@ -52,13 +52,20 @@ public class SSMPEvent {
     public final SSMPIdentifier from;
     public final Type type;
     public final @Nullable SSMPIdentifier to;
-    public final @Nullable String payload;
+    public final @Nullable byte[] payload;
+    public final boolean binary;
 
-    public SSMPEvent(SSMPIdentifier from, Type type, @Nullable SSMPIdentifier to, @Nullable String payload) {
+    public SSMPEvent(SSMPIdentifier from, Type type, @Nullable SSMPIdentifier to, @Nullable byte[] payload) {
+        this(from, type, to, payload, false);
+    }
+
+    public SSMPEvent(SSMPIdentifier from, Type type, @Nullable SSMPIdentifier to,
+                     @Nullable byte[] payload, boolean binary) {
         this.from = from;
         this.type = type;
         this.to = to;
         this.payload = payload;
+        this.binary = binary;
     }
 
     @Override

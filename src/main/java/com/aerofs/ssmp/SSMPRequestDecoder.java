@@ -1,37 +1,28 @@
-/*
- * Copyright (c) 2015, Air Computing Inc. <oss@aerofs.com>
- * All rights reserved.
- */
-
 package com.aerofs.ssmp;
 
+import com.aerofs.ssmp.SSMPRequest.Type;
 import org.jboss.netty.buffer.ChannelBuffer;
 import org.jboss.netty.buffer.ChannelBuffers;
 import org.jboss.netty.channel.*;
+import org.jboss.netty.handler.codec.frame.FrameDecoder;
 import org.jboss.netty.handler.timeout.IdleState;
 import org.jboss.netty.handler.timeout.IdleStateEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.EOFException;
 import java.net.SocketAddress;
 import java.nio.channels.ClosedChannelException;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.TimeUnit;
 
 import static com.aerofs.ssmp.SSMPDecoder.*;
-import static com.aerofs.ssmp.SSMPDecoder.readIdentifier;
-import static com.aerofs.ssmp.SSMPDecoder.readPayload;
+import static com.aerofs.ssmp.SSMPRequest.*;
 
-public class SSMPServerCodec extends SimpleChannelHandler {
-    private final static Logger L = LoggerFactory.getLogger(SSMPServerCodec.class);
+public class SSMPRequestDecoder extends FrameDecoder {
+    private final static Logger L = LoggerFactory.getLogger(SSMPRequestDecoder.class);
 
     private final Authenticator _auth;
-
-    public interface Authenticator {
-        boolean authenticate(SSMPIdentifier id, SSMPIdentifier scheme, String cred);
-
-        ChannelBuffer unauthorized();
-    }
 
     public static class IdAddress extends SocketAddress {
         static final long serialVersionUID = -1;
@@ -49,7 +40,7 @@ public class SSMPServerCodec extends SimpleChannelHandler {
         }
     }
 
-    public SSMPServerCodec(Authenticator auth) {
+    public SSMPRequestDecoder(Authenticator auth) {
         _auth = auth;
     }
 
@@ -76,7 +67,7 @@ public class SSMPServerCodec extends SimpleChannelHandler {
     private static final ChannelBuffer PONG = ChannelBuffers.wrappedBuffer(
             "000 . PONG\n".getBytes(StandardCharsets.US_ASCII));
 
-    public void channelIdle(ChannelHandlerContext ctx, IdleStateEvent e) {
+    private void channelIdle(ChannelHandlerContext ctx, IdleStateEvent e) {
         if (e.getState() == IdleState.READER_IDLE) {
             Object a = ctx.getChannel().getAttachment();
             // connect/login timeout
@@ -88,7 +79,6 @@ public class SSMPServerCodec extends SimpleChannelHandler {
             if (d.timer.elapsed() > TimeUnit.MILLISECONDS.convert(60, TimeUnit.SECONDS)) {
                 ctx.getChannel().close();
             } else {
-                L.debug("send ping");
                 ctx.sendDownstream(new DownstreamMessageEvent(ctx.getChannel(),
                         new DefaultChannelFuture(ctx.getChannel(), false), PING, null));
             }
@@ -124,28 +114,30 @@ public class SSMPServerCodec extends SimpleChannelHandler {
     }
 
     @Override
-    public void messageReceived(ChannelHandlerContext ctx, MessageEvent me) {
+    protected Object decode(ChannelHandlerContext ctx, Channel channel, ChannelBuffer b)
+            throws Exception {
+        final int readerIndex = b.readerIndex();
         Object o = ctx.getChannel().getAttachment();
-
-        ChannelBuffer b = (ChannelBuffer)me.getMessage();
-
         try {
-            SSMPRequest.Type type = readRequestType(b);
+            byte[] verb = readVerb(b);
+            SSMPRequest.Type type = Type.byName(verb);
 
             if (o instanceof ChannelFuture) {
-                if (type != SSMPRequest.Type.LOGIN) {
-                    sendDownstream(ctx, BAD_REQUEST);
-                    ctx.getChannel().close();
-                    return;
+                if (type != SSMPRequest.Type.LOGIN || !next(b)) {
+                    throw new IllegalArgumentException();
                 }
-
                 SSMPIdentifier id = readIdentifier(b);
+                if (!next(b)) throw new IllegalArgumentException();
                 SSMPIdentifier scheme = readIdentifier(b);
-                String cred = readPayload(b);
+                String cred = "";
+                if (next(b)) {
+                    cred = new String(readPayload(b), StandardCharsets.UTF_8);
+                    if (next(b)) throw new IllegalArgumentException();
+                }
                 if (_auth.authenticate(id, scheme, cred)) {
                     ChannelData d = new ChannelData(id);
                     ctx.getChannel().setAttachment(d);
-                    ctx.sendUpstream(new UpstreamChannelStateEvent(me.getChannel(),
+                    ctx.sendUpstream(new UpstreamChannelStateEvent(ctx.getChannel(),
                             ChannelState.CONNECTED, true));
                     ((ChannelFuture)o).setSuccess();
                     sendDownstream(ctx, OK);
@@ -153,89 +145,56 @@ public class SSMPServerCodec extends SimpleChannelHandler {
                     sendDownstream(ctx, _auth.unauthorized());
                     ctx.getChannel().close();
                 }
-                return;
+                return null;
             }
 
             if (type == null) {
+                skipCompat(b);
                 sendDownstream(ctx, NOT_IMPLEMENTED);
-                return;
+                return null;
             } else if (type == SSMPRequest.Type.LOGIN) {
                 sendDownstream(ctx, NOT_ALLOWED);
-                return;
+                ctx.getChannel().close();
+                return null;
             } else if (type == SSMPRequest.Type.PING) {
+                if (next(b)) throw new IllegalArgumentException();
                 L.debug("recv ping");
                 sendDownstream(ctx, PONG);
-                return;
+                return null;
             } else if (type == SSMPRequest.Type.PONG) {
+                if (next(b)) throw new IllegalArgumentException();
                 L.debug("recv pong");
-                return;
+                return null;
             }
-
-            ChannelData d = (ChannelData)o;
 
             SSMPIdentifier to = null;
             if ((type._fields & SSMPRequest.FIELD_ID) != 0) {
+                if (!next(b)) throw new IllegalArgumentException();
                 to = readIdentifier(b);
             }
             byte[] payload = null;
-            if ((type._fields & SSMPRequest.FIELD_PAYLOAD) != 0) {
-                payload = readPayloadBytes(b);
-                if (payload.length == 0
-                        && (type._fields & SSMPRequest.FIELD_OPTION) != SSMPRequest.FIELD_OPTION) {
-                    throw new IllegalArgumentException();
+            boolean binary = false;
+            if ((type._fields & FIELD_PAYLOAD) != 0) {
+                boolean atEnd = atEnd(b);
+                if (atEnd) {
+                    if ((type._fields & FIELD_OPTION) != FIELD_OPTION) {
+                        throw new IllegalArgumentException();
+                    }
+                } else {
+                    next(b);
+                    binary = isBinaryPayload(b);
+                    payload = readPayload(b);
                 }
             }
-
-            ctx.sendUpstream(new UpstreamMessageEvent(me.getChannel(),
-                    new SSMPRequest(type, to, payload), d));
+            if (next(b)) throw new IllegalArgumentException();
+            return new SSMPRequest(type, to, payload, binary);
+        } catch (EOFException e) {
+            // reset reader index if we failed to read a full message
+            b.readerIndex(readerIndex);
         } catch (IllegalArgumentException e) {
             sendDownstream(ctx, BAD_REQUEST);
+            ctx.getChannel().close();
         }
-    }
-
-    private final static byte[] EVENT_CODE = "000 ".getBytes(StandardCharsets.US_ASCII);
-
-    @Override
-    public void writeRequested(ChannelHandlerContext ctx, MessageEvent me) {
-        Object o = me.getMessage();
-        if (o instanceof SSMPResponse) {
-            SSMPResponse r = (SSMPResponse)o;
-
-            ChannelBuffer b = ChannelBuffers.dynamicBuffer();
-            if (r.code < 0 || r.code > 999) {
-                throw new IllegalArgumentException("invalid response code: " + r.code);
-            }
-
-            int n = r.code;
-            b.writeByte('0' + (byte)(n / 100));
-            b.writeByte('0' + (byte)(n / 10 % 10));
-            b.writeByte('0' + (byte)(n % 10));
-            if (r.payload != null && !r.payload.isEmpty()) {
-                b.writeByte(' ');
-                b.writeBytes(r.payload.getBytes(StandardCharsets.UTF_8));
-            }
-            b.writeByte('\n');
-            ctx.sendDownstream(new DownstreamMessageEvent(me.getChannel(), me.getFuture(), b, null));
-        } else if (o instanceof SSMPEvent) {
-            SSMPEvent ev = (SSMPEvent)o;
-
-            ChannelBuffer b = ChannelBuffers.dynamicBuffer();
-            b.writeBytes(EVENT_CODE);
-            b.writeBytes(ev.from.getBytes());
-            b.writeByte(' ');
-            b.writeBytes(ev.type.toString().getBytes(StandardCharsets.US_ASCII));
-            if (ev.to != null) {
-                b.writeByte(' ');
-                b.writeBytes(ev.to.getBytes());
-            }
-            if (ev.payload != null && !ev.payload.isEmpty()) {
-                b.writeByte(' ');
-                b.writeBytes(ev.payload.getBytes(StandardCharsets.UTF_8));
-            }
-            b.writeByte('\n');
-            ctx.sendDownstream(new DownstreamMessageEvent(me.getChannel(), me.getFuture(), b, null));
-        } else {
-            ctx.sendDownstream(me);
-        }
+        return null;
     }
 }

@@ -7,68 +7,105 @@ package com.aerofs.ssmp;
 
 import org.jboss.netty.buffer.ChannelBuffer;
 
-import javax.annotation.Nullable;
-import java.nio.charset.StandardCharsets;
+import java.io.EOFException;
 
 public class SSMPDecoder {
-    public static int readCode(ChannelBuffer b) {
-        if (b.readableBytes() < 3) throw new IllegalArgumentException();
+    public static final int CODE_LENGTH = 3;
+    public static final int MAX_VERB_LENGTH = 16;
+    public static final int MAX_ID_LENGTH = 64;
+    public static final int MAX_PAYLOAD_LENGTH = 1024;
+
+    public static boolean atEnd(ChannelBuffer b) {
+        return b.readable() && b.getByte(b.readerIndex()) == '\n';
+    }
+
+    public static boolean next(ChannelBuffer b) throws EOFException {
+        if (!b.readable()) throw new EOFException();
+        byte c = b.readByte();
+        if (c == '\n') return false;
+        if (c != ' ') throw new IllegalArgumentException();
+        return true;
+    }
+
+    public static int readCode(ChannelBuffer b) throws EOFException {
+        if (b.readableBytes() < 4) throw new EOFException();
         int n = 0;
-        for (int i = 0; i < 3; ++i) {
-            byte c = b.readByte();
+        for (int i = 0; i < CODE_LENGTH; ++i) {
+            byte c = b.getByte(b.readerIndex() + i);
             if (c < '0' || c > '9') throw new IllegalArgumentException();
             n = 10 * n + (c - '0');
         }
+        byte c = b.getByte(b.readerIndex() + CODE_LENGTH);
+        if (c != ' ' && c != '\n') throw new IllegalArgumentException();
+        b.skipBytes(3);
         return n;
     }
 
-    public static byte[] read(ChannelBuffer b, ByteSet s) {
+    public static byte[] read(ChannelBuffer b, ByteSet s, int max) throws EOFException {
         int n = 0;
-        while (n < b.readableBytes()) {
+        while (true) {
+            if (n == max) throw new IllegalArgumentException();
+            if (n == b.readableBytes()) throw new EOFException();
             byte c = b.getByte(b.readerIndex() + n);
-            if (c == ' ') break;
+            if (c == ' ' || c == '\n') {
+                if (n == 0) throw new IllegalArgumentException();
+                byte[] id = new byte[n];
+                b.readBytes(id);
+                return id;
+            }
             if (!s.contains(c)) throw new IllegalArgumentException();
             ++n;
         }
-        if (n <= 0) throw new IllegalArgumentException();
-        byte[] id = new byte[n];
-        b.readBytes(id);
-        skipSpace(b);
-        return id;
     }
 
-    public static SSMPIdentifier readIdentifier(ChannelBuffer b) {
-        byte[] id = read(b, SSMPIdentifier.ALLOWED);
-        return new SSMPIdentifier(id);
+    public static SSMPIdentifier readIdentifier(ChannelBuffer b) throws EOFException {
+        return new SSMPIdentifier(read(b, SSMPIdentifier.ALLOWED, MAX_ID_LENGTH));
     }
 
-    private static final ByteSet VERB = new ByteSet(ByteSet.Range('A', 'Z'));
+    public static final ByteSet VERB = new ByteSet(ByteSet.Range('A', 'Z'));
 
-    public static SSMPEvent.Type readEventType(ChannelBuffer b) {
-        byte[] verb = read(b, VERB);
-        SSMPEvent.Type t = SSMPEvent.Type.byName(verb);
-        if (t == null) throw new IllegalArgumentException();
-        return t;
-    }
-    public static @Nullable SSMPRequest.Type readRequestType(ChannelBuffer b) {
-        byte[] verb = read(b, VERB);
-        return SSMPRequest.Type.byName(verb);
+    public static byte[] readVerb(ChannelBuffer b) throws EOFException {
+        return read(b, VERB, MAX_VERB_LENGTH);
     }
 
-    public static byte[] readPayloadBytes(ChannelBuffer b) {
-        byte[] array = new byte[b.readableBytes()];
-        b.readBytes(array);
-        return array;
+    public static boolean isBinaryPayload(ChannelBuffer b) throws EOFException {
+        if (!b.readable()) return false;
+        byte c = b.getByte(b.readerIndex());
+        return c >= 0 && c <= 3;
     }
 
-    public static String readPayload(ChannelBuffer b) {
-        return b.readBytes(b.readableBytes()).toString(StandardCharsets.UTF_8);
+    public static byte[] readPayload(ChannelBuffer b) throws EOFException {
+        int n = b.readableBytes();
+        if (n < 1) throw new EOFException();
+        byte c = b.getByte(b.readerIndex());
+        if (c >= 0 && c <= 3) {
+            if (n < 2) throw new EOFException();
+            int sz = 1 + ((int)c << 8) + ((int)b.getByte(b.readerIndex() + 1) & 0xff);
+            if (sz > MAX_PAYLOAD_LENGTH) throw new IllegalArgumentException();
+            if (n < sz + 1) throw new EOFException();
+            if (b.getByte(b.readerIndex() + 2 + sz) != '\n') throw new IllegalArgumentException();
+            byte[] v = new byte[sz];
+            b.skipBytes(2);
+            b.readBytes(v);
+            return v;
+        }
+        int i = b.indexOf(b.readerIndex(), b.readerIndex() + n, (byte)'\n');
+        if (i == -1) {
+            if (n > MAX_PAYLOAD_LENGTH) throw new IllegalArgumentException();
+            throw new EOFException();
+        }
+        int sz = i - b.readerIndex();
+        if (sz == 0 || sz > MAX_PAYLOAD_LENGTH) throw new IllegalArgumentException();
+        byte[] v = new byte[sz];
+        b.readBytes(v);
+        return v;
     }
 
-    public static void skipSpace(ChannelBuffer b) {
-        int i = 0;
-        while (i < b.readableBytes() && b.getByte(b.readerIndex() + i) == ' ') ++i;
-        if (i == 0 && b.readable()) throw new IllegalArgumentException();
-        b.skipBytes(i);
+    public static void skipCompat(ChannelBuffer b) throws EOFException {
+        try {
+            readIdentifier(b);
+            if (!next(b)) return;
+        } catch (IllegalArgumentException e) {}
+        readPayload(b);
     }
 }

@@ -11,6 +11,8 @@ import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 import java.nio.charset.StandardCharsets;
 
+import static com.aerofs.ssmp.SSMPDecoder.MAX_PAYLOAD_LENGTH;
+
 public class SSMPRequest {
     final static int NO_FIELD = 0;
     final static int FIELD_ID = 1;
@@ -66,23 +68,32 @@ public class SSMPRequest {
     public final Type type;
     public final @Nullable SSMPIdentifier to;
     public final @Nullable byte[] payload;
+    public final boolean binary;
 
-    SSMPRequest(Type type, @Nullable SSMPIdentifier to, @Nullable byte[] payload) {
+    SSMPRequest(Type type, @Nullable SSMPIdentifier to, @Nullable byte[] payload, boolean binary) {
         this.type = type;
         this.to = to;
         this.payload = payload;
+        this.binary = binary;
     }
 
-    private static boolean isValid(String payload) {
+    private static boolean isValidText(String payload) {
         for (int i = 0; i < payload.length(); ++i) {
             char c = payload.charAt(i);
-            if (c == '\n' || c == '\r') return false;
+            if (c == '\n' || (c >= 0 && c <= 3)) return false;
         }
         return true;
     }
 
-    private static void checkPayload(String payload) {
-        if (payload.length() == 0 || !isValid(payload)) {
+    private static void checkTextPayload(String payload) {
+        checkPayloadLength(payload.length());
+        if (!isValidText(payload)) {
+            throw new IllegalArgumentException();
+        }
+    }
+
+    private static void checkPayloadLength(int length) {
+        if (length <= 0 || length > MAX_PAYLOAD_LENGTH) {
             throw new IllegalArgumentException();
         }
     }
@@ -96,33 +107,48 @@ public class SSMPRequest {
     public static SSMPRequest login(@Nonnull SSMPIdentifier id, @Nonnull SSMPIdentifier scheme,
                                     @Nonnull String cred) {
         return new SSMPRequest(Type.LOGIN, id, (scheme + (cred.isEmpty() ? cred : " " + cred))
-                .getBytes(StandardCharsets.UTF_8));
+                .getBytes(StandardCharsets.UTF_8), false);
     }
 
     public static SSMPRequest subscribe(@Nonnull SSMPIdentifier topic, SubscriptionFlag flag) {
-        return new SSMPRequest(Type.SUBSCRIBE, topic, flag._s);
+        return new SSMPRequest(Type.SUBSCRIBE, topic, flag._s, false);
     }
 
     public static SSMPRequest unsubscribe(@Nonnull SSMPIdentifier topic) {
-        return new SSMPRequest(Type.UNSUBSCRIBE, topic, null);
+        return new SSMPRequest(Type.UNSUBSCRIBE, topic, null, false);
     }
 
     public static SSMPRequest ucast(@Nonnull SSMPIdentifier user, @Nonnull String payload) {
-        checkPayload(payload);
-        return new SSMPRequest(Type.UCAST, user, payload.getBytes(StandardCharsets.UTF_8));
+        checkTextPayload(payload);
+        return new SSMPRequest(Type.UCAST, user, payload.getBytes(StandardCharsets.UTF_8), false);
+    }
+
+    public static SSMPRequest ucast(@Nonnull SSMPIdentifier user, @Nonnull byte[] payload) {
+        checkPayloadLength(payload.length);
+        return new SSMPRequest(Type.UCAST, user, payload, true);
     }
 
     public static SSMPRequest mcast(@Nonnull SSMPIdentifier topic, @Nonnull String payload) {
-        checkPayload(payload);
-        return new SSMPRequest(Type.MCAST, topic, payload.getBytes(StandardCharsets.UTF_8));
+        checkTextPayload(payload);
+        return new SSMPRequest(Type.MCAST, topic, payload.getBytes(StandardCharsets.UTF_8), false);
+    }
+
+    public static SSMPRequest mcast(@Nonnull SSMPIdentifier user, @Nonnull byte[] payload) {
+        checkPayloadLength(payload.length);
+        return new SSMPRequest(Type.MCAST, user, payload, true);
     }
 
     public static SSMPRequest bcast(@Nonnull String payload) {
-        checkPayload(payload);
-        return new SSMPRequest(Type.BCAST, null, payload.getBytes(StandardCharsets.UTF_8));
+        checkTextPayload(payload);
+        return new SSMPRequest(Type.BCAST, null, payload.getBytes(StandardCharsets.UTF_8), false);
+    }
+
+    public static SSMPRequest bcast(@Nonnull byte[] payload) {
+        checkPayloadLength(payload.length);
+        return new SSMPRequest(Type.BCAST, null, payload, true);
     }
 
     public static SSMPRequest close() {
-        return new SSMPRequest(Type.CLOSE, null, null);
+        return new SSMPRequest(Type.CLOSE, null, null, false);
     }
 }

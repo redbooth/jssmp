@@ -7,8 +7,9 @@ package com.aerofs.ssmp;
 
 import com.google.common.util.concurrent.*;
 import org.jboss.netty.bootstrap.ClientBootstrap;
+import org.jboss.netty.buffer.ChannelBuffer;
+import org.jboss.netty.buffer.ChannelBuffers;
 import org.jboss.netty.channel.*;
-import org.jboss.netty.handler.codec.frame.LineBasedFrameDecoder;
 import org.jboss.netty.handler.timeout.IdleStateHandler;
 import org.jboss.netty.util.Timer;
 import org.slf4j.Logger;
@@ -16,6 +17,9 @@ import org.slf4j.LoggerFactory;
 
 import java.net.InetSocketAddress;
 import java.nio.channels.ClosedChannelException;
+import java.nio.charset.StandardCharsets;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -49,9 +53,9 @@ public class SSMPClient {
         _bootstrap.setOption("connectTimeoutMillis", 5000);
         _bootstrap.setPipelineFactory(() -> Channels.pipeline(
                 sslHandlerFactory.newSslHandler(),
-                new LineBasedFrameDecoder(1024, true, true),
                 new IdleStateHandler(timer, 30, 0, 0, TimeUnit.SECONDS),
-                new SSMPClientCodec(handler)
+                new SSMPResponseDecoder(),
+                new Dispatcher(handler)
         ));
     }
 
@@ -115,5 +119,85 @@ public class SSMPClient {
             c.write(new Message(r, f));
         }
         return f;
+    }
+
+    private static class Dispatcher extends SimpleChannelHandler {
+        private final EventHandler _handler;
+        private final Queue<SettableFuture<SSMPResponse>> _responses = new ConcurrentLinkedQueue<>();
+
+        Dispatcher(EventHandler handler) { _handler = handler; }
+
+        @Override
+        public void channelClosed(ChannelHandlerContext ctx, ChannelStateEvent e) {
+            SettableFuture<SSMPResponse> f;
+            while ((f = _responses.poll()) != null) {
+                f.setException(new ClosedChannelException());
+            }
+        }
+
+        @Override
+        public void exceptionCaught(ChannelHandlerContext ctx, ExceptionEvent e) {
+            if (!(e instanceof ClosedChannelException)) {
+                L.warn("uncaught exception {}", e.getCause());
+            }
+            ctx.getChannel().close();
+        }
+
+        @Override
+        public void messageReceived(ChannelHandlerContext ctx, MessageEvent me) throws Exception {
+            Object o = me.getMessage();
+            if (o instanceof SSMPEvent) {
+                SSMPEvent ev = (SSMPEvent) o;
+                if (L.isDebugEnabled()) {
+                    L.debug("recv event {} {} {} {}", ev.from, ev.type, ev.to, ev.binary
+                            ? ev.payload : (ev.payload != null
+                                    ? new String(ev.payload, StandardCharsets.UTF_8) : null));
+                }
+                _handler.eventReceived(ev);
+            } else if (o instanceof SSMPResponse) {
+                SSMPResponse r = (SSMPResponse) o;
+                L.debug("recv response {}", r.code);
+                SettableFuture<SSMPResponse> f = _responses.remove();
+                f.set(r);
+            } else {
+                super.messageReceived(ctx, me);
+            }
+        }
+
+        @Override
+        public void writeRequested(ChannelHandlerContext ctx, MessageEvent me) {
+            Object o = me.getMessage();
+            if (o instanceof SSMPClient.Message) {
+                SSMPClient.Message m = (SSMPClient.Message) o;
+                if (!ctx.getChannel().isConnected()) {
+                    m.f.setException(new ClosedChannelException());
+                    return;
+                }
+                _responses.add(m.f);
+
+                ChannelBuffer b = ChannelBuffers.dynamicBuffer();
+                b.writeBytes(m.r.type._s);
+                if (m.r.to != null) {
+                    b.writeByte(' ');
+                    b.writeBytes(m.r.to.getBytes());
+                }
+                if (m.r.payload != null && m.r.payload.length > 0) {
+                    if (m.r.payload.length > SSMPDecoder.MAX_PAYLOAD_LENGTH) {
+                        throw new IllegalArgumentException("text payload too large");
+                    }
+                    b.writeByte(' ');
+                    if (m.r.binary) {
+                        int sz = m.r.payload.length - 1;
+                        b.writeByte(sz >> 8);
+                        b.writeByte(sz & 0xff);
+                    }
+                    b.writeBytes(m.r.payload);
+                }
+                b.writeByte('\n');
+                ctx.sendDownstream(new DownstreamMessageEvent(me.getChannel(), me.getFuture(), b, null));
+            } else {
+                ctx.sendDownstream(me);
+            }
+        }
     }
 }

@@ -5,14 +5,12 @@
 
 package com.aerofs.ssmp;
 
-import com.aerofs.ssmp.SSMPServerCodec.Authenticator;
-import com.aerofs.ssmp.SSMPServerCodec.ChannelData;
-import com.aerofs.ssmp.SSMPServerCodec.IdAddress;
+import com.aerofs.ssmp.SSMPRequestDecoder.ChannelData;
+import com.aerofs.ssmp.SSMPRequestDecoder.IdAddress;
 import com.aerofs.ssmp.SSMPEvent.Type;
 import com.aerofs.ssmp.SSMPRequest.SubscriptionFlag;
 import org.jboss.netty.bootstrap.ServerBootstrap;
 import org.jboss.netty.channel.*;
-import org.jboss.netty.handler.codec.frame.LineBasedFrameDecoder;
 import org.jboss.netty.handler.timeout.IdleStateHandler;
 import org.jboss.netty.util.Timer;
 
@@ -116,9 +114,9 @@ public class SSMPServer extends SimpleChannelUpstreamHandler {
         _bootstrap = new ServerBootstrap(channelFactory);
         _bootstrap.setPipelineFactory(() -> Channels.pipeline(
                 sslHandlerFactory.newSslHandler(),
-                new LineBasedFrameDecoder(1024, true, true),
                 new IdleStateHandler(timer, 30, 0, 0, TimeUnit.SECONDS),
-                new SSMPServerCodec(auth),
+                new SSMPRequestDecoder(auth),
+                new SSMPResponseEncoder(),
                 this
         ));
     }
@@ -151,7 +149,7 @@ public class SSMPServer extends SimpleChannelUpstreamHandler {
 
     @Override
     public void messageReceived(ChannelHandlerContext ctx, MessageEvent me) {
-        requestReceived(ctx.getChannel(), ((IdAddress)me.getRemoteAddress()).id,
+        requestReceived(ctx.getChannel(), ((IdAddress)ctx.getChannel().getAttachment()).id,
                 (SSMPRequest)me.getMessage());
     }
 
@@ -182,11 +180,13 @@ public class SSMPServer extends SimpleChannelUpstreamHandler {
                 if (id.equals(from)) return;
                 if (s.presence) {
                     s.c.c.write(new SSMPEvent(from, Type.SUBSCRIBE, r.to,
-                            presence ? SubscriptionFlag.PRESENCE.name() : null));
+                            presence ? SubscriptionFlag.PRESENCE.name()
+                                    .getBytes(StandardCharsets.US_ASCII) : null));
                 }
                 if (presence) {
                     channel.write(new SSMPEvent(s.c.id, Type.SUBSCRIBE, r.to,
-                            s.presence ? SubscriptionFlag.PRESENCE.name() : null));
+                            s.presence ? SubscriptionFlag.PRESENCE.name()
+                                    .getBytes(StandardCharsets.US_ASCII) : null));
                 }
             });
             break;
@@ -217,8 +217,7 @@ public class SSMPServer extends SimpleChannelUpstreamHandler {
                 channel.write(new SSMPResponse(SSMPResponse.NOT_FOUND, null));
                 return;
             }
-            c.c.write(new SSMPEvent(from, Type.UCAST, r.to,
-                    new String(r.payload, StandardCharsets.UTF_8)));
+            c.c.write(new SSMPEvent(from, Type.UCAST, r.to, r.payload, r.binary));
             channel.write(new SSMPResponse(SSMPResponse.OK, null));
             break;
         }
@@ -226,8 +225,7 @@ public class SSMPServer extends SimpleChannelUpstreamHandler {
             Topic t = _topics.get(r.to);
             if (t != null) {
                 t.forEach((id, s) -> {
-                    s.c.c.write(new SSMPEvent(from, Type.MCAST, r.to,
-                            new String(r.payload, StandardCharsets.UTF_8)));
+                    s.c.c.write(new SSMPEvent(from, Type.MCAST, r.to, r.payload, r.binary));
                 });
             }
             channel.write(new SSMPResponse(SSMPResponse.OK, null));
@@ -243,8 +241,7 @@ public class SSMPServer extends SimpleChannelUpstreamHandler {
             for (Topic t : c.sub.values()) {
                 t.forEach((id, s) -> {
                     if (id.equals(from) || !ids.add(id)) return;
-                    s.c.c.write(new SSMPEvent(from, Type.BCAST, null,
-                            new String(r.payload, StandardCharsets.UTF_8)));
+                    s.c.c.write(new SSMPEvent(from, Type.BCAST, null, r.payload, r.binary));
                 });
             }
             channel.write(new SSMPResponse(SSMPResponse.OK, null));
