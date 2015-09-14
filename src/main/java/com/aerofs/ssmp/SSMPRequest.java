@@ -77,17 +77,9 @@ public class SSMPRequest {
         this.binary = binary;
     }
 
-    private static boolean isValidText(String payload) {
-        for (int i = 0; i < payload.length(); ++i) {
-            char c = payload.charAt(i);
-            if (c == '\n' || (c >= 0 && c <= 3)) return false;
-        }
-        return true;
-    }
-
     private static void checkTextPayload(String payload) {
         checkPayloadLength(payload.length());
-        if (!isValidText(payload)) {
+        if (payload.charAt(0) <= 3 || payload.indexOf('\n') != -1) {
             throw new IllegalArgumentException();
         }
     }
